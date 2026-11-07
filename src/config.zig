@@ -70,6 +70,9 @@ pub const Config = struct {
     };
 
     pub const Request = struct {
+        // Called synchronously on each original Host value before authority rewriting.
+        // The value is borrowed for this call only; the policy must be thread-safe.
+        original_host_policy: ?*const fn ([]const u8) bool = null,
         lazy_read_size: ?usize = null,
         max_body_size: ?usize = null,
         buffer_size: ?usize = null,

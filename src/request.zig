@@ -607,6 +607,8 @@ pub const State = struct {
     // constant config
     lazy_read_size: ?usize,
 
+    original_host_policy: ?*const fn ([]const u8) bool,
+
     // For reading the body, we might need more than `buf`.
     buffer_pool: *buffer.Pool,
 
@@ -698,6 +700,7 @@ pub const State = struct {
             .chunked = null,
             .buffer_pool = buffer_pool,
             .lazy_read_size = config.lazy_read_size,
+            .original_host_policy = config.original_host_policy,
             .max_body_size = config.max_body_size orelse 1_048_576,
             .middlewares = std.StringHashMap(*anyopaque).init(arena),
             .qs = try StringKeyValue.init(arena, config.max_query_count orelse 32),
@@ -1083,12 +1086,16 @@ pub const State = struct {
                 if (content_length != null) return error.InvalidContentLength;
                 content_length = value;
             } else if (std.mem.eql(u8, key, "host")) {
+                if (self.original_host_policy) |policy| {
+                    if (!policy(value)) return error.InvalidHost;
+                }
                 if (host_index != null) return error.InvalidHost;
                 host_index = i;
             }
         }
 
         if (self.authority) |authority| {
+            if (self.protocol == .HTTP11 and host_index == null) return error.InvalidHost;
             // With an absolute-form request target, the Host header is ignored
             // and the target's authority is used instead (RFC 9112 section 3.2.2).
             if (host_index) |i| {
@@ -1639,8 +1646,8 @@ test "request: parse request target" {
     }
 
     {
-        // an empty path is "/", and a missing Host header is added
-        const r = try testParse("GET HTTPS://pondzpondz.com:8443?a=1 HTTP/1.1\r\n\r\n", .{});
+        // an empty path is "/"
+        const r = try testParse("GET HTTPS://pondzpondz.com:8443?a=1 HTTP/1.1\r\nHost: pondzpondz.com:8443\r\n\r\n", .{});
         try t.expectString("/?a=1", r.url.raw);
         try t.expectString("/", r.url.path);
         try t.expectString("pondzpondz.com:8443", r.header("host").?);
@@ -1655,7 +1662,7 @@ test "request: parse request target" {
 
     {
         // IP-literal with a port
-        const r = try testParse("GET http://[::1]:8080/x HTTP/1.1\r\n\r\n", .{});
+        const r = try testParse("GET http://[::1]:8080/x HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n", .{});
         try t.expectString("/x", r.url.raw);
         try t.expectString("[::1]:8080", r.header("host").?);
     }
@@ -1665,6 +1672,87 @@ test "request: parse request target" {
         try t.expectString("/", r.url.raw);
         try t.expectString("pondzpondz.com", r.header("host").?);
     }
+}
+
+test "request: original Host policy runs before authority normalization" {
+    defer t.reset();
+    const Policy = struct {
+        var calls: usize = 0;
+        var reject: bool = false;
+
+        fn check(value: []const u8) bool {
+            // Only the original field value may reach this policy.
+            std.debug.assert(std.mem.eql(u8, value, "original.example"));
+            calls += 1;
+            return !reject;
+        }
+    };
+    Policy.calls = 0;
+    Policy.reject = false;
+    var pool = try buffer.Pool.init(t.io, t.allocator, 1, 64);
+    defer pool.deinit();
+    var state = try State.init(t.arena.allocator(), &pool, &.{ .original_host_policy = Policy.check });
+    defer state.deinit();
+
+    state.protocol = .HTTP11;
+    state.authority = "effective.example";
+    state.headers.add("host", "original.example");
+    try t.expectEqual(null, try state.checkHeaderValidity());
+    try t.expectEqual(1, Policy.calls);
+    try t.expectString("effective.example", state.headers.get("host").?);
+
+    state.reset();
+    Policy.calls = 0;
+    Policy.reject = true;
+    state.protocol = .HTTP11;
+    state.authority = "effective.example";
+    state.headers.add("host", "original.example");
+    try t.expectError(error.InvalidHost, state.checkHeaderValidity());
+    try t.expectEqual(1, Policy.calls);
+    try t.expectString("original.example", state.headers.get("host").?);
+
+    state.reset();
+    Policy.calls = 0;
+    Policy.reject = false;
+    state.protocol = .HTTP11;
+    state.authority = "effective.example";
+    try t.expectError(error.InvalidHost, state.checkHeaderValidity());
+    try t.expectEqual(0, Policy.calls);
+    try t.expectEqual(0, state.headers.len);
+
+    // HTTP/1.0 may omit Host; preserve its effective authority.
+    state.protocol = .HTTP10;
+    try t.expectEqual(null, try state.checkHeaderValidity());
+    try t.expectString("effective.example", state.headers.get("host").?);
+    try t.expectEqual(0, Policy.calls);
+
+    // The policy sees original fields in both target forms and protocols.
+    inline for (.{ http.Protocol.HTTP10, http.Protocol.HTTP11 }) |protocol| {
+        state.reset();
+        Policy.calls = 0;
+        state.protocol = protocol;
+        state.headers.add("host", "original.example");
+        try t.expectEqual(null, try state.checkHeaderValidity());
+        try t.expectEqual(1, Policy.calls);
+        try t.expectString("original.example", state.headers.get("host").?);
+    }
+
+    state.reset();
+    Policy.calls = 0;
+    state.protocol = .HTTP11;
+    state.authority = "effective.example";
+    state.headers.add("host", "original.example");
+    state.headers.add("host", "original.example");
+    try t.expectError(error.InvalidHost, state.checkHeaderValidity());
+    try t.expectEqual(2, Policy.calls);
+    try t.expectString("original.example", state.headers.values[0]);
+    try t.expectString("original.example", state.headers.values[1]);
+
+    // Presence and duplicate rejection do not depend on installing a policy.
+    state.original_host_policy = null;
+    try t.expectError(error.InvalidHost, state.checkHeaderValidity());
+    state.headers.reset();
+    try t.expectError(error.InvalidHost, state.checkHeaderValidity());
 }
 
 test "request: parse protocol" {
