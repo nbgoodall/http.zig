@@ -1358,19 +1358,21 @@ test "httpz: chunked body too big" {
     defer stream.close(t.io);
     var writer = stream.writer(t.io, &.{});
     const w = &writer.interface;
-    try w.writeAll("POST /echo_body HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
-    var sent: usize = 0;
-    while (sent < total) {
-        const take = @min(@as(usize, 4096), total - sent);
-        try w.print("{x}\r\n", .{take});
-        try w.writeAll(body[sent .. sent + take]);
-        try w.writeAll("\r\n");
-        sent += take;
+    // The server can reject the body before the client finishes any write.
+    // Even after an early close, require the exact rejection response below.
+    send: {
+        w.writeAll("POST /echo_body HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n") catch break :send;
+        var sent: usize = 0;
+        while (sent < total) {
+            const take = @min(@as(usize, 4096), total - sent);
+            w.print("{x}\r\n", .{take}) catch break :send;
+            w.writeAll(body[sent .. sent + take]) catch break :send;
+            w.writeAll("\r\n") catch break :send;
+            sent += take;
+        }
+        w.writeAll("0\r\n\r\n") catch break :send;
+        w.flush() catch {};
     }
-    try w.writeAll("0\r\n\r\n");
-    // The server may close the connection mid-write once it errors; ignore
-    // a broken pipe.
-    w.flush() catch {};
 
     var buf: [100]u8 = undefined;
     try t.expectString("HTTP/1.1 413 \r\nConnection: Close\r\nContent-Length: 23\r\n\r\nRequest body is too big", testReadAll(stream, &buf));
