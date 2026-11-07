@@ -180,7 +180,6 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
             conn.handover = .unknown;
             conn.tracked = &tracked;
             conn.stream = .{ .socket = .{ .handle = socket, .address = ip_address } };
-            defer conn.tracked = null;
 
             var is_keepalive = false;
             while (true) {
@@ -193,7 +192,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                         tracked.close(io);
                         // impossible for this to fail in blocking mode
                         conn.requestDone(self.retain_allocated_bytes_keepalive, false) catch unreachable;
-                        self.http_conn_pool.release(conn);
+                        release_blocking_connection(&self.http_conn_pool, conn);
                         return;
                     },
                     .websocket => |ptr| {
@@ -203,7 +202,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                         const hc: *ws.HandlerConn(WSH) = @ptrCast(@alignCast(ptr));
                         // impossible for this to fail in blocking mode
                         conn.requestDone(self.retain_allocated_bytes_keepalive, false) catch unreachable;
-                        self.http_conn_pool.release(conn);
+                        release_blocking_connection(&self.http_conn_pool, conn);
                         // blocking read loop
                         // will close the connection
                         self.handleWebSocket(hc) catch |err| {
@@ -214,7 +213,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                     .disown => {
                         // impossible for this to fail in blocking mode
                         conn.requestDone(self.retain_allocated_bytes_keepalive, false) catch unreachable;
-                        self.http_conn_pool.release(conn);
+                        release_blocking_connection(&self.http_conn_pool, conn);
                         return;
                     },
                 }
@@ -1927,6 +1926,12 @@ pub const HTTPConn = struct {
     }
 };
 
+fn release_blocking_connection(pool: anytype, conn: *HTTPConn) void {
+    // The pool may recycle or destroy conn, so detach stack-owned tracking first.
+    conn.tracked = null;
+    pool.release(conn);
+}
+
 fn parse_nonblocking_request(conn: *HTTPConn) !bool {
     // Keep WouldBlock on the socket path: no available bytes means wait for
     // another event, rather than passing a nonblocking socket to an Io reader.
@@ -2010,6 +2015,34 @@ fn loopType() LoopType {
 }
 
 const t = @import("t.zig");
+test "blocking worker detaches tracking before returning connection ownership" {
+    const MockPool = struct {
+        releases: usize = 0,
+
+        fn release(self: *@This(), conn: *HTTPConn) void {
+            // Check before accepting ownership; a broken order cannot proceed
+            // to a post-release access, even in a failing test.
+            if (conn.tracked != null) @panic("tracking must be detached before pool release");
+            self.releases += 1;
+        }
+    };
+    var sockets: TrackedSockets = .{};
+    var tracked: TrackedSocket = .{ .socket = -1, .owner = &sockets };
+    sockets.add(t.io, &tracked);
+    defer tracked.remove(t.io);
+
+    // Only tracked is used. No real pool allocation, release, reuse or free.
+    var conn: HTTPConn = undefined;
+    conn.tracked = &tracked;
+    var pool: MockPool = .{};
+    release_blocking_connection(&pool, &conn);
+
+    // Do not inspect conn after transferring ownership.
+    try t.expectEqual(@as(usize, 1), pool.releases);
+    try t.expectEqual(true, tracked.in_list);
+    try t.expectEqual(@as(?*TrackedSocket, &tracked), sockets.list.head);
+}
+
 test "nonblocking parser retains partial requests when no data is available" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
