@@ -585,11 +585,9 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                                 // other thread is accessing the connection, so we
                                 // can access _state directly.
 
-                                const stream = http_conn.stream;
-                                var reader = stream.reader(io, &.{}); // Request.State does its own buffering
-                                const done = http_conn.req_state.parse(http_conn, &reader.interface) catch |err| {
+                                const done = parse_nonblocking_request(http_conn) catch |err| {
                                     // maybe a write fail or something, doesn't matter, we're closing the connection
-                                    requestError(http_conn, reader.err orelse err) catch {};
+                                    requestError(http_conn, err) catch {};
 
                                     // impossible to fail when false is passed
                                     http_conn.requestDone(self.retain_allocated_bytes, false) catch unreachable;
@@ -1929,6 +1927,15 @@ pub const HTTPConn = struct {
     }
 };
 
+fn parse_nonblocking_request(conn: *HTTPConn) !bool {
+    // Keep WouldBlock on the socket path: no available bytes means wait for
+    // another event, rather than passing a nonblocking socket to an Io reader.
+    return conn.req_state.parse(conn, conn.stream.socket.handle) catch |err| switch (err) {
+        error.WouldBlock => false,
+        else => return err,
+    };
+}
+
 pub fn timestamp(io: Io) u32 {
     return @intCast(Io.Timestamp.now(io, .awake).toSeconds());
 }
@@ -2003,6 +2010,53 @@ fn loopType() LoopType {
 }
 
 const t = @import("t.zig");
+test "nonblocking parser retains partial requests when no data is available" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var sockets: [2]posix.fd_t = undefined;
+    try t.expectEqual(@as(c_int, 0), std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets));
+    defer posix.close(sockets[0]);
+    defer posix.close(sockets[1]);
+    const flags = try posix.fcntl(sockets[0], posix.F.GETFL, 0);
+    _ = try posix.fcntl(sockets[0], posix.F.SETFL, flags | @as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
+
+    var bp = try BufferPool.init(t.io, t.allocator, 2, 64);
+    defer bp.deinit();
+    var conn = try HTTPConn.init(t.io, t.allocator, &bp, undefined, 0, &.{ .request = .{ .buffer_size = 256 } });
+    defer conn.deinit(t.allocator);
+    conn.stream = .{ .socket = .{
+        .handle = sockets[0],
+        .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } },
+    } };
+
+    try t.expectEqual(false, try parse_nonblocking_request(&conn));
+    try t.expectEqual(@as(usize, 0), conn.req_state.len);
+    inline for (.{
+        .{ "POST / HTTP/1.1\r\nContent-Length: 4\r\n", "\r\nab", "cd" },
+        .{ "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n", "\r\n4\r\nab", "cd\r\n0\r\n\r\n" },
+    }) |parts| {
+        try t.expectEqual(parts[0].len, try posix.write(sockets[1], parts[0]));
+        try t.expectEqual(false, try parse_nonblocking_request(&conn));
+        const header_len = conn.req_state.len;
+        try t.expectEqual(false, try parse_nonblocking_request(&conn));
+        try t.expectEqual(header_len, conn.req_state.len);
+        try t.expectEqual(parts[1].len, try posix.write(sockets[1], parts[1]));
+        try t.expectEqual(false, try parse_nonblocking_request(&conn));
+        const body_pos = conn.req_state.body_pos;
+        try t.expectEqual(false, try parse_nonblocking_request(&conn));
+        try t.expectEqual(body_pos, conn.req_state.body_pos);
+        try t.expectEqual(parts[2].len, try posix.write(sockets[1], parts[2]));
+        try t.expectEqual(true, try parse_nonblocking_request(&conn));
+        try t.expectEqual(@as(usize, 4), conn.req_state.body_len);
+        try t.expectString("abcd", conn.req_state.body.?.data[0..4]);
+        try conn.requestDone(0, false);
+    }
+    try posix.shutdown(sockets[1], .send);
+    try std.testing.expectError(error.ConnectionClosed, parse_nonblocking_request(&conn));
+    conn.stream.socket.handle = -1;
+    try std.testing.expectError(error.NotOpenForReading, parse_nonblocking_request(&conn));
+}
+
 test "HTTPConnPool" {
     var bp = try BufferPool.init(t.io, t.allocator, 2, 64);
     defer bp.deinit();
